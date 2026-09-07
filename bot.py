@@ -1,18 +1,4 @@
-"""Bot de som de entrada — discord.py 2.x.
-
-Quando um membro entra em qualquer canal de voz do servidor, o bot conecta no
-mesmo canal e toca ``src/sound/burenya.mp3``. Cada nova entrada durante a
-reprodução (ou na janela de 2s de "aguardo") adiciona mais uma reprodução à
-fila; o som pode tocar várias vezes (uma por entrada). Só depois de 2 segundos
-sem nenhuma entrada o bot desconecta, evitando poluição sonora de log/quit.
-
-Eventos usados (ver https://discordpy.readthedocs.io/en/latest/api.html):
-- ``on_voice_state_update``: ``before.channel is None`` e ``after.channel``
-  definido == alguém acabou de entrar em um canal de voz. É o evento correto
-  para detecção de entrada em canal de voz (não exige intent privilegiada).
-
-Requer a intent ``voice_states`` (não privilegiada).
-"""
+"""Toca um som quando alguém entra em canal de voz."""
 
 from __future__ import annotations
 
@@ -27,24 +13,15 @@ import discord
 from discord import opus as discord_opus
 from dotenv import load_dotenv
 
-# --------------------------------------------------------------------------
-# Configuração
-# --------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 SOUND_PATH = BASE_DIR / "src" / "sound" / "burenya.mp3"
-
-# Tempo que o bot espera após a última reprodução antes de sair do canal.
 EXIT_DELAY_SECONDS = 2.0
 
 log = logging.getLogger("neko.greeter")
 
 
 def _load_opus() -> None:
-    """Garante que o libopus esteja carregado.
-
-    No Termux/Linux o ``find_library('opus')`` padrão pode falhar, então
-    tentamos nomes comuns explícitos antes de recorrer ao fallback.
-    """
+    """Carrega libopus (Termux às vezes não acha sozinho)."""
     if discord_opus.is_loaded():
         return
     candidates = ["libopus.so", "libopus.so.0", "libopus.so.1", "libopus.so.8"]
@@ -68,11 +45,8 @@ def _load_opus() -> None:
         )
 
 
-# --------------------------------------------------------------------------
-# Núcleo: "anunciador" de entrada
-# --------------------------------------------------------------------------
 class _GuildState:
-    """Estado por guild: contagem de reproduções pendentes e worker."""
+    """Estado por guild: fila de reproduções e worker."""
 
     __slots__ = ("lock", "pending", "worker", "channel")
 
@@ -84,13 +58,7 @@ class _GuildState:
 
 
 class JoinAnnouncer:
-    """Agenda a reprodução do som de boas-vindas e controla a conexão de voz.
-
-    - Cada entrada incrementa ``pending`` (fila de reproduções).
-    - Um worker por guild consome a fila, toca o som uma vez por entrada,
-      espera ``exit_delay`` e, se nenhuma entrada nova chegou nesse intervalo,
-      desconecta.
-    """
+    """Toca o som de entrada e controla a conexão de voz."""
 
     def __init__(
         self,
@@ -107,10 +75,8 @@ class JoinAnnouncer:
     async def handle_join(
         self, channel: discord.abc.VoiceChannel | discord.StageChannel
     ) -> None:
-        """Chamado quando um membro (não-bot) entra em um canal de voz."""
+        """Membro entrou em canal de voz."""
         guild = channel.guild
-        # O estado por guild é mantido vivo: nunca é removido do dicionário,
-        # para evitar corrida com o worker que pode estar finalizando agora.
         state = self._states.setdefault(guild.id, _GuildState())
 
         async with state.lock:
@@ -124,9 +90,7 @@ class JoinAnnouncer:
     async def _ensure_connected(
         self, state: _GuildState, channel: discord.abc.VoiceChannel | discord.StageChannel
     ) -> None:
-        """Conecta (ou move) o bot para o canal. Compensa falha transitória
-        típica do Discord: sessão de voz invalidada logo após disconnect (4006).
-        """
+        """Conecta/move o bot. Tenta de novo se o Discord invalidar a sessão."""
         guild = channel.guild
         vc = guild.voice_client
         if vc is not None and not vc.is_connected():
@@ -136,8 +100,6 @@ class JoinAnnouncer:
         for attempt in range(2):
             try:
                 if vc is None:
-                    # reconnect=False evita sessão semi-morta ("conectado" mas
-                    # sem áudio), que é o sintoma "entra e sai sem som".
                     await channel.connect(
                         timeout=15.0, reconnect=False, self_deaf=False
                     )
@@ -146,14 +108,10 @@ class JoinAnnouncer:
             except (discord.ClientException, discord.ConnectionClosed, asyncio.TimeoutError):
                 if attempt == 1:
                     raise
-                log.warning(
-                    "Guild %s: falha transitória na conexão; limpando e retentando.",
-                    guild.id,
-                )
+                log.warning("Guild %s: falha na conexão; retentando.", guild.id)
                 stale = guild.voice_client
                 if stale is not None:
                     await self._drop_voice_client(guild, stale)
-                # Dá tempo do Discord liberar a sessão antes de tentar de novo.
                 await asyncio.sleep(1.0)
                 vc = None
                 continue
@@ -171,12 +129,7 @@ class JoinAnnouncer:
         guild: discord.Guild,
         vc: discord.VoiceClient | discord.VoiceProtocol,
     ) -> None:
-        """Desconecta e remove o voice client do registro interno do client.
-
-        discord.py pode manter referência em ``Client._voice_clients`` mesmo
-        após ``disconnect()``, o que faz o próximo ``channel.connect()`` falhar
-        (ClientException). A combinação disconnect + cleanup + remove resolve.
-        """
+        """Desconecta e limpa o voice client por completo."""
         try:
             await vc.disconnect(force=True)
         except Exception:
@@ -197,7 +150,7 @@ class JoinAnnouncer:
                 )
 
     async def _run(self, guild_id: int) -> None:
-        """Worker: consome a fila de reproduções e sai quando silenciar."""
+        """Consome a fila e desconecta quando silenciar."""
         state = self._states[guild_id]
         try:
             while True:
@@ -210,13 +163,8 @@ class JoinAnnouncer:
                 for _ in range(plays):
                     await self._play_once(state)
 
-                # Janela de aguardo: novas entradas nesse período fazem o som
-                # tocar de novo em vez de o bot desconectar.
                 await asyncio.sleep(self.exit_delay)
 
-                # Tudo sob o mesmo lock: assim um join que chegar agora ou
-                # (a) incrementa pending ANTES do check (worker continua), ou
-                # (b) espera o disconnect e então se reconecta com worker novo.
                 async with state.lock:
                     if state.pending:
                         continue  # chegou gente durante o aguardo/reprodução
@@ -241,7 +189,7 @@ class JoinAnnouncer:
     async def _play_once(
         self, state: _GuildState
     ) -> None:
-        """Toca o arquivo de som uma vez e aguarda terminar."""
+        """Toca o som uma vez e espera terminar."""
         if state.channel is None:
             log.warning("Pulando reprodução: sem canal associado.")
             return
@@ -260,28 +208,14 @@ class JoinAnnouncer:
         def _after(error: Exception | None) -> None:
             if error is not None:
                 log.error("Erro na reprodução: %r", error)
-            # O callback pode rodar em outra thread: agende thread-safe.
             try:
                 loop.call_soon_threadsafe(done.set)
             except RuntimeError:
-                pass  # loop já fechado
+                pass
 
         try:
-            # Se alguma reprodução anterior continuou ativa (corridas raras),
-            # pará-la antes evita falha silenciosa no voice client.
             if vc.is_playing():
                 vc.stop()
-
-            # Diagnóstico: se secret_key/mode não estiverem prontos, o Discord
-            # descarta pacotes silenciosamente (sintoma: ffmpeg roda, sem som).
-            log.info(
-                "Voice ready: mode=%s latency=%.0fms secret=%s endpoint=%s",
-                getattr(vc, "mode", None),
-                (vc.latency or 0) * 1000,
-                "set" if getattr(vc, "secret_key", None) else "NONE",
-                getattr(vc, "endpoint", None),
-            )
-
             source = discord.FFmpegPCMAudio(
                 str(self.sound_path),
                 before_options="-loglevel warning",
@@ -297,8 +231,7 @@ class JoinAnnouncer:
         try:
             await asyncio.wait_for(done.wait(), timeout=30.0)
         except asyncio.TimeoutError:
-            # Travou (após-callback nunca chamado): não deixa o worker pendurado.
-            log.warning("Reprodução sem fim há >30s; forçando stop.")
+            log.warning("Reprodução >30s; parando.")
             try:
                 if vc.is_playing():
                     vc.stop()
@@ -317,15 +250,11 @@ class JoinAnnouncer:
         self._states.clear()
 
 
-# --------------------------------------------------------------------------
-# Cliente
-# --------------------------------------------------------------------------
 class GreeterClient(discord.Client):
     def __init__(self, *, sound_path: Path = SOUND_PATH) -> None:
         intents = discord.Intents.default()
-        intents.voice_states = True  # necessário p/ on_voice_state_update
+        intents.voice_states = True
         super().__init__(intents=intents)
-        # Criado após super().__init__: o announcer recebe o client pronto.
         self.announcer = JoinAnnouncer(self, sound_path=sound_path)
 
     async def on_ready(self) -> None:
@@ -344,7 +273,7 @@ class GreeterClient(discord.Client):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        # Só nos interessa "entrou agora": estava em canal nenhum e foi para um.
+        # Só "entrou agora": antes sem canal, depois em um canal.
         if before.channel is not None or after.channel is None:
             return
         if member.bot:
@@ -364,15 +293,11 @@ class GreeterClient(discord.Client):
         self.announcer.cancel_guild(guild.id)
 
 
-# --------------------------------------------------------------------------
-# Entrypoint
-# --------------------------------------------------------------------------
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
-    # Silencia o INFO prolixo do gateway, mantém avisos importantes.
     logging.getLogger("discord.gateway").setLevel(logging.WARNING)
 
     load_dotenv(BASE_DIR / ".env")
