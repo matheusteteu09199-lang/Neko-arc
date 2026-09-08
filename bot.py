@@ -1,4 +1,4 @@
-"""Toca um som quando alguém entra em canal de voz."""
+"""Toca um som quando alguém entra em canal de voz e fica na call."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 SOUND_PATH = BASE_DIR / "src" / "sound" / "burenya.mp3"
-EXIT_DELAY_SECONDS = 2.0
 
 log = logging.getLogger("neko.greeter")
 
@@ -24,12 +23,11 @@ def _load_opus() -> None:
     """Carrega libopus (Termux às vezes não acha sozinho)."""
     if discord_opus.is_loaded():
         return
-    candidates = ["libopus.so", "libopus.so.0", "libopus.so.1", "libopus.so.8"]
-    for name in candidates:
+    for name in ("libopus.so", "libopus.so.0", "libopus.so.1", "libopus.so.8"):
         try:
             discord_opus.load_opus(name)
             if discord_opus.is_loaded():
-                log.info("libopus carregado via %s", name)
+                log.info("libopus via %s", name)
                 return
         except Exception:
             continue
@@ -40,232 +38,24 @@ def _load_opus() -> None:
         except Exception:
             pass
     if not discord_opus.is_loaded():
-        log.error(
-            "libopus não encontrado! Instale com: pkg install libopus"
-        )
-
-
-class _GuildState:
-    """Estado por guild: fila de reproduções e worker."""
-
-    __slots__ = ("lock", "pending", "worker", "channel")
-
-    def __init__(self) -> None:
-        self.lock: asyncio.Lock = asyncio.Lock()
-        self.pending: int = 0
-        self.worker: asyncio.Task | None = None
-        self.channel: discord.abc.VoiceChannel | discord.StageChannel | None = None
-
-
-class JoinAnnouncer:
-    """Toca o som de entrada e controla a conexão de voz."""
-
-    def __init__(
-        self,
-        client: discord.Client,
-        *,
-        sound_path: Path = SOUND_PATH,
-        exit_delay: float = EXIT_DELAY_SECONDS,
-    ) -> None:
-        self.client = client
-        self.sound_path = sound_path
-        self.exit_delay = exit_delay
-        self._states: dict[int, _GuildState] = {}
-
-    async def handle_join(
-        self, channel: discord.abc.VoiceChannel | discord.StageChannel
-    ) -> None:
-        """Membro entrou em canal de voz."""
-        guild = channel.guild
-        state = self._states.setdefault(guild.id, _GuildState())
-
-        async with state.lock:
-            state.pending += 1
-            await self._ensure_connected(state, channel)
-            if state.worker is None or state.worker.done():
-                state.worker = asyncio.create_task(
-                    self._run(guild.id), name=f"greeter-{guild.id}"
-                )
-
-    async def _ensure_connected(
-        self, state: _GuildState, channel: discord.abc.VoiceChannel | discord.StageChannel
-    ) -> None:
-        """Conecta/move o bot. Tenta de novo se o Discord invalidar a sessão."""
-        guild = channel.guild
-        vc = guild.voice_client
-        if vc is not None and not vc.is_connected():
-            await self._drop_voice_client(guild, vc)
-            vc = None
-
-        for attempt in range(2):
-            try:
-                if vc is None:
-                    await channel.connect(
-                        timeout=15.0, reconnect=False, self_deaf=False
-                    )
-                elif vc.channel != channel:
-                    await vc.move_to(channel)
-            except (discord.ClientException, discord.ConnectionClosed, asyncio.TimeoutError):
-                if attempt == 1:
-                    raise
-                log.warning("Guild %s: falha na conexão; retentando.", guild.id)
-                stale = guild.voice_client
-                if stale is not None:
-                    await self._drop_voice_client(guild, stale)
-                await asyncio.sleep(1.0)
-                vc = None
-                continue
-            break
-
-        vc = guild.voice_client
-        if vc is None or not vc.is_connected():
-            raise RuntimeError(
-                f"Voz não conectou no canal #{channel.name} (guild {guild.id})"
-            )
-        state.channel = channel
-
-    async def _drop_voice_client(
-        self,
-        guild: discord.Guild,
-        vc: discord.VoiceClient | discord.VoiceProtocol,
-    ) -> None:
-        """Desconecta e limpa o voice client por completo."""
-        try:
-            await vc.disconnect(force=True)
-        except Exception:
-            log.warning("Falha no disconnect (guild %s)", guild.id, exc_info=True)
-        try:
-            vc.cleanup()
-        except Exception:
-            log.warning("Falha no cleanup (guild %s)", guild.id, exc_info=True)
-        remover = getattr(self.client, "_remove_voice_client", None)
-        if remover is not None:
-            try:
-                remover(guild.id)
-            except Exception:
-                log.warning(
-                    "Falha ao remover voice client do registry (guild %s)",
-                    guild.id,
-                    exc_info=True,
-                )
-
-    async def _run(self, guild_id: int) -> None:
-        """Consome a fila e desconecta quando silenciar."""
-        state = self._states[guild_id]
-        try:
-            while True:
-                async with state.lock:
-                    plays = state.pending
-                    state.pending = 0
-                if plays:
-                    log.debug("Guild %s: %d reprodução(ões) na fila.", guild_id, plays)
-
-                for _ in range(plays):
-                    await self._play_once(state)
-
-                await asyncio.sleep(self.exit_delay)
-
-                async with state.lock:
-                    if state.pending:
-                        continue  # chegou gente durante o aguardo/reprodução
-
-                    guild = self.client.get_guild(guild_id)
-                    vc = guild.voice_client if guild is not None else None
-                    state.channel = None
-                    state.worker = None
-                    if guild is not None and vc is not None:
-                        try:
-                            await self._drop_voice_client(guild, vc)
-                        except Exception:
-                            log.exception("Erro ao desconectar (guild %s)", guild_id)
-                    log.info("Guild %s: sem entradas, desconectando.", guild_id)
-                    return
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Worker do guild %s morreu inesperadamente", guild_id)
-            state.worker = None
-
-    async def _play_once(
-        self, state: _GuildState
-    ) -> None:
-        """Toca o som uma vez e espera terminar."""
-        if state.channel is None:
-            log.warning("Pulando reprodução: sem canal associado.")
-            return
-        vc = state.channel.guild.voice_client
-        if vc is None or not vc.is_connected():
-            log.warning(
-                "Pulando reprodução: voice client %s em #%s.",
-                "ausente" if vc is None else "desconectado",
-                state.channel.name,
-            )
-            return
-
-        loop = asyncio.get_running_loop()
-        done = asyncio.Event()
-
-        def _after(error: Exception | None) -> None:
-            if error is not None:
-                log.error("Erro na reprodução: %r", error)
-            try:
-                loop.call_soon_threadsafe(done.set)
-            except RuntimeError:
-                pass
-
-        try:
-            if vc.is_playing():
-                vc.stop()
-            source = discord.FFmpegPCMAudio(
-                str(self.sound_path),
-                before_options="-loglevel warning",
-            )
-            vc.play(source, after=_after)
-        except discord.opus.OpusNotLoaded:
-            log.error("Opus não carregado — instale libopus (pkg install libopus).")
-            return
-        except Exception:
-            log.exception("Falha ao iniciar reprodução")
-            return
-
-        try:
-            await asyncio.wait_for(done.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            log.warning("Reprodução >30s; parando.")
-            try:
-                if vc.is_playing():
-                    vc.stop()
-            except Exception:
-                pass
-
-    def cancel_guild(self, guild_id: int) -> None:
-        state = self._states.get(guild_id)
-        if state is not None and state.worker is not None:
-            state.worker.cancel()
-
-    def cancel_all(self) -> None:
-        for state in self._states.values():
-            if state.worker is not None:
-                state.worker.cancel()
-        self._states.clear()
+        log.error("libopus não encontrado! pkg install libopus")
 
 
 class GreeterClient(discord.Client):
     def __init__(self, *, sound_path: Path = SOUND_PATH) -> None:
         intents = discord.Intents.default()
         intents.voice_states = True
+        intents.members = True
         super().__init__(intents=intents)
-        self.announcer = JoinAnnouncer(self, sound_path=sound_path)
+        self.sound_path = sound_path
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    def _lock_for(self, guild_id: int) -> asyncio.Lock:
+        return self._locks.setdefault(guild_id, asyncio.Lock())
 
     async def on_ready(self) -> None:
         assert self.user is not None
-        log.info("Conectado como %s (id=%s)", self.user, self.user.id)
-
-        perms = discord.Permissions(connect=True, speak=True, view_channel=True)
-        invite = discord.utils.oauth_url(
-            self.user.id, permissions=perms, scopes=("bot",)
-        )
-        log.info("Convite com permissões de voz: %s", invite)
+        log.info("Conectado como %s", self.user)
 
     async def on_voice_state_update(
         self,
@@ -273,24 +63,95 @@ class GreeterClient(discord.Client):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        # Só "entrou agora": antes sem canal, depois em um canal.
-        if before.channel is not None or after.channel is None:
-            return
         if member.bot:
             return
 
-        log.info(
-            "%s entrou em #%s — agendando som de entrada.",
-            getattr(member, "display_name", None) or member,
-            after.channel,
-        )
-        try:
-            await self.announcer.handle_join(after.channel)
-        except Exception:
-            log.exception("Erro ao tratar entrada de %s", member)
+        # Saiu: se a call ficou vazia de humanos, bot desconecta.
+        if before.channel and not after.channel:
+            await self._maybe_disconnect(before.channel)
+            return
 
-    async def on_guild_remove(self, guild: discord.Guild) -> None:
-        self.announcer.cancel_guild(guild.id)
+        # Entrou (de lugar nenhum): conecta e toca som.
+        if not before.channel and after.channel:
+            await self._announce(after.channel)
+            return
+
+    async def _announce(self, channel: discord.abc.VoiceChannel) -> None:
+        guild = channel.guild
+        async with self._lock_for(guild.id):
+            vc = guild.voice_client
+            try:
+                if vc is None or not vc.is_connected():
+                    if vc is not None:
+                        await self._drop(guild, vc)
+                    vc = await channel.connect(
+                        timeout=15.0, reconnect=False, self_deaf=False
+                    )
+                elif vc.channel != channel:
+                    await vc.move_to(channel)
+            except Exception:
+                log.exception("Falha ao conectar em #%s", channel.name)
+                return
+
+            await self._play(vc)
+
+    async def _play(self, vc: discord.VoiceClient) -> None:
+        if vc.is_playing():
+            vc.stop()
+        done = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _after(err: Exception | None) -> None:
+            if err:
+                log.error("Erro na reprodução: %r", err)
+            try:
+                loop.call_soon_threadsafe(done.set)
+            except RuntimeError:
+                pass
+
+        try:
+            source = discord.FFmpegPCMAudio(
+                str(self.sound_path), before_options="-loglevel warning"
+            )
+            vc.play(source, after=_after)
+        except Exception:
+            log.exception("Falha ao iniciar reprodução")
+            return
+
+        try:
+            await asyncio.wait_for(done.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            if vc.is_playing():
+                vc.stop()
+
+    async def _maybe_disconnect(self, channel: discord.abc.VoiceChannel) -> None:
+        guild = channel.guild
+        async with self._lock_for(guild.id):
+            vc = guild.voice_client
+            if vc is None or vc.channel != channel:
+                return
+            # Recarrega a lista (a voz do membro que saiu já foi removida).
+            humans = [m for m in channel.members if not m.bot]
+            if humans:
+                return
+            log.info("Guild %s: call vazia, saindo.", guild.id)
+            await self._drop(guild, vc)
+
+    async def _drop(self, guild: discord.Guild, vc: discord.VoiceClient) -> None:
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            log.warning("disconnect falhou (guild %s)", guild.id, exc_info=True)
+        try:
+            vc.cleanup()
+        except Exception:
+            log.warning("cleanup falhou (guild %s)", guild.id, exc_info=True)
+        remover = getattr(self, "_remove_voice_client", None)
+        if remover is not None:
+            try:
+                remover(guild.id)
+            except Exception:
+                log.warning("remove_voice_client falhou", exc_info=True)
 
 
 def main() -> None:
@@ -303,19 +164,16 @@ def main() -> None:
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("TOKEN") or os.getenv("DISCORD_TOKEN")
     if not token:
-        sys.exit("Erro: defina TOKEN no arquivo .env")
-
+        sys.exit("Erro: defina TOKEN no .env")
     if not SOUND_PATH.exists():
-        sys.exit(f"Erro: arquivo de som não encontrado: {SOUND_PATH}")
+        sys.exit(f"Erro: {SOUND_PATH} não encontrado")
 
     _load_opus()
-
     client = GreeterClient(sound_path=SOUND_PATH)
-
     try:
         client.run(token, log_handler=None)
     except discord.LoginFailure:
-        sys.exit("Erro: token inválido (LoginFailure). Verifique o TOKEN no .env")
+        sys.exit("Erro: token inválido")
 
 
 if __name__ == "__main__":
