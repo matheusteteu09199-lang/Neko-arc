@@ -1,6 +1,6 @@
 # Neko-arc
 
-Bot Discord que toca um som quando alguém entra em canal de voz.
+Seu bot aí ze
 
 ## Termux
 
