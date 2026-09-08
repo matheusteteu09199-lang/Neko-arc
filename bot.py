@@ -93,6 +93,7 @@ class GreeterClient(discord.Client):
                 log.exception("Falha ao conectar em #%s", channel.name)
                 return
 
+            await asyncio.sleep(5.0)
             await self._play(vc)
 
     async def _play(self, vc: discord.VoiceClient) -> None:
@@ -110,19 +111,9 @@ class GreeterClient(discord.Client):
                 pass
 
         try:
-            # Estratégia: primeiro manda 1s de tom inaudível pra "abrir" o stream
-            # do Discord, depois encadeia o som real. O Discord costuma descartar
-            # os primeiros ~1-2s de áudio de uma sessão nova.
-            warmup = discord.FFmpegPCMAudio(
-                "anullsrc=r=48000:cl=stereo",
-                before_options="-f lavfi -t 1.0 -loglevel error",
-            )
-            await self._wait_play(vc, warmup)
-
             source = discord.FFmpegPCMAudio(
                 str(self.sound_path),
                 before_options="-loglevel warning",
-                options="-af apad=pad_dur=1.5",
             )
             vc.play(source, after=_after)
         except Exception:
@@ -131,24 +122,6 @@ class GreeterClient(discord.Client):
 
         try:
             await asyncio.wait_for(done.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            if vc.is_playing():
-                vc.stop()
-
-    async def _wait_play(self, vc: discord.VoiceClient, source) -> None:
-        """Toca uma fonte até o fim (helper para warm-up silencioso)."""
-        done = asyncio.Event()
-        loop = asyncio.get_running_loop()
-
-        def _after(err):
-            try:
-                loop.call_soon_threadsafe(done.set)
-            except RuntimeError:
-                pass
-
-        vc.play(source, after=_after)
-        try:
-            await asyncio.wait_for(done.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             if vc.is_playing():
                 vc.stop()
