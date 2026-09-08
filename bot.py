@@ -93,7 +93,18 @@ class GreeterClient(discord.Client):
                 log.exception("Falha ao conectar em #%s", channel.name)
                 return
 
-            await asyncio.sleep(5.0)
+        # Dorme FORA do lock pra não segurar outras entradas.
+        await asyncio.sleep(5.0)
+
+        # Só toca se o canal ainda tiver humanos (evita tocar quando quem
+        # entrou já saiu durante o sleep).
+        async with self._lock_for(guild.id):
+            vc = guild.voice_client
+            if vc is None or not vc.is_connected():
+                return
+            humans = [m for m in channel.members if not m.bot and m != self.user]
+            if not humans:
+                return
             await self._play(vc)
 
     async def _play(self, vc: discord.VoiceClient) -> None:
