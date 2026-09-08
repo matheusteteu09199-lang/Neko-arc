@@ -93,8 +93,6 @@ class GreeterClient(discord.Client):
                 log.exception("Falha ao conectar em #%s", channel.name)
                 return
 
-            # Dá tempo do Discord abrir a sessão UDP antes de mandar áudio.
-            await asyncio.sleep(0.4)
             await self._play(vc)
 
     async def _play(self, vc: discord.VoiceClient) -> None:
@@ -112,12 +110,13 @@ class GreeterClient(discord.Client):
                 pass
 
         try:
-            # apad estende o áudio com silêncio: evita o corte do Discord
-            # quando o som é muito curto e o fim chega antes do stream estabilizar.
+            # adelay=3000|3000: 3s de silêncio antes do som (compensa o delay
+            # inicial do Discord, que costuma cortar o áudio quando ele começa
+            # rápido demais). apad=1.5 garante padding no fim também.
             source = discord.FFmpegPCMAudio(
                 str(self.sound_path),
                 before_options="-loglevel warning",
-                options="-af apad=pad_dur=1.5",
+                options="-af adelay=3000|3000,apad=pad_dur=1.5",
             )
             vc.play(source, after=_after)
         except Exception:
