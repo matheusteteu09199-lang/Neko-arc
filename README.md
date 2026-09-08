@@ -11,10 +11,9 @@ pip install -r requirements.txt
 
 ## Config
 
-Crie `.env` com:
-
-```
-TOKEN=seu_token_aqui
+```bash
+cp .env.example .env
+nano .env   # cole seu token aqui
 ```
 
 ## Run
